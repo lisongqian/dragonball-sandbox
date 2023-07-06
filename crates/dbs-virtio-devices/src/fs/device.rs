@@ -16,9 +16,6 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use caps::{CapSet, Capability};
-use dbs_device::resources::{DeviceResources, ResourceConstraint};
-use dbs_utils::epoll_manager::{EpollManager, SubscriberId};
-use dbs_utils::rate_limiter::{BucketUpdate, RateLimiter};
 use fuse_backend_rs::api::{Vfs, VfsIndex, VfsOptions};
 use fuse_backend_rs::passthrough::{CachePolicy, Config as PassthroughConfig, PassthroughFs};
 use kvm_bindings::kvm_userspace_memory_region;
@@ -35,6 +32,10 @@ use vm_memory::{
     FileOffset, GuestAddress, GuestAddressSpace, GuestRegionMmap, GuestUsize, MmapRegion,
 };
 use vmm_sys_util::eventfd::EventFd;
+
+use dbs_device::resources::{DeviceResources, ResourceConstraint};
+use dbs_utils::epoll_manager::{EpollManager, SubscriberId};
+use dbs_utils::rate_limiter::{BucketUpdate, RateLimiter};
 
 use crate::{
     ActivateError, ActivateResult, Error, Result, VirtioDevice, VirtioDeviceConfig,
@@ -793,7 +794,7 @@ where
             offset,
             data
         );
-        self.device_info.read_config(offset, data)
+        self.device_info.read_config(offset, data);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -804,7 +805,7 @@ where
             offset,
             data
         );
-        self.device_info.write_config(offset, data)
+        self.device_info.write_config(offset, data);
     }
 
     fn activate(&mut self, config: VirtioDeviceConfig<AS, Q>) -> ActivateResult {
@@ -963,18 +964,20 @@ pub mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use dbs_device::resources::DeviceResources;
-    use dbs_interrupt::NoopNotifier;
     use kvm_ioctls::Kvm;
     use virtio_queue::QueueSync;
     use vm_memory::GuestMemoryRegion;
     use vm_memory::{GuestAddress, GuestMemoryMmap, GuestRegionMmap};
     use vmm_sys_util::tempfile::TempFile;
+
+    use dbs_device::resources::DeviceResources;
+    use dbs_interrupt::NoopNotifier;
     use Error as VirtIoError;
 
-    use super::*;
     use crate::device::VirtioRegionHandler;
     use crate::{ActivateError, VirtioQueueConfig, TYPE_VIRTIO_FS};
+
+    use super::*;
 
     pub(crate) const TAG: &str = "test";
     pub(crate) const NUM_QUEUES: usize = 1;
