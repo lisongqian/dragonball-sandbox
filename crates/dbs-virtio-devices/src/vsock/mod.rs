@@ -5,22 +5,24 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-pub mod backend;
-pub mod csm;
-mod device;
-mod epoll_handler;
-pub mod muxer;
-mod packet;
-
 use std::os::unix::io::AsRawFd;
 
 use vm_memory::GuestMemoryError;
 
 pub use self::defs::{NUM_QUEUES, QUEUE_SIZES};
 pub use self::device::Vsock;
+pub use self::metrics::*;
 use self::muxer::Error as MuxerError;
 pub use self::muxer::VsockMuxer;
 use self::packet::VsockPacket;
+
+pub mod backend;
+pub mod csm;
+mod device;
+mod epoll_handler;
+mod metrics;
+pub mod muxer;
+mod packet;
 
 mod defs {
     /// RX queue event: the driver added available buffers to the RX queue.
@@ -182,13 +184,20 @@ mod tests {
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::Arc;
 
-    use dbs_device::resources::DeviceResources;
-    use dbs_interrupt::NoopNotifier;
-    use dbs_utils::epoll_manager::EpollManager;
     use kvm_ioctls::Kvm;
     use virtio_queue::QueueSync;
     use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryMmap, GuestRegionMmap};
     use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
+
+    use dbs_device::resources::DeviceResources;
+    use dbs_interrupt::NoopNotifier;
+    use dbs_utils::epoll_manager::EpollManager;
+
+    use crate::device::VirtioDeviceConfig;
+    use crate::tests::{VirtQueue as GuestQ, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+    use crate::vsock::metrics::VsockDeviceMetrics;
+    use crate::Result as VirtioResult;
+    use crate::VirtioQueueConfig;
 
     use super::backend::VsockBackend;
     use super::defs::{EVQ_EVENT, RXQ_EVENT, TXQ_EVENT};
@@ -196,10 +205,6 @@ mod tests {
     use super::muxer::{Result as MuxerResult, VsockGenericMuxer};
     use super::packet::{VsockPacket, VSOCK_PKT_HDR_SIZE};
     use super::*;
-    use crate::device::VirtioDeviceConfig;
-    use crate::tests::{VirtQueue as GuestQ, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
-    use crate::Result as VirtioResult;
-    use crate::VirtioQueueConfig;
 
     pub fn test_bytes(src: &[u8], dst: &[u8]) {
         let min_len = std::cmp::min(src.len(), dst.len());
@@ -216,6 +221,7 @@ mod tests {
         pub rx_ok_cnt: usize,
         pub tx_ok_cnt: usize,
         pub evset: Option<epoll::Events>,
+        pub metrics: Arc<VsockDeviceMetrics>,
     }
 
     impl TestMuxer {
@@ -228,6 +234,7 @@ mod tests {
                 rx_ok_cnt: 0,
                 tx_ok_cnt: 0,
                 evset: None,
+                metrics: Arc::new(VsockDeviceMetrics::default()),
             }
         }
 
@@ -319,6 +326,8 @@ mod tests {
             const MEM_SIZE: usize = 1024 * 1024 * 128;
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap();
             let epoll_manager = EpollManager::default();
+            let muxer = TestMuxer::new();
+            let metrics = muxer.metrics.clone();
             Self {
                 cid: CID,
                 mem,
@@ -328,7 +337,8 @@ mod tests {
                     CID,
                     Arc::new(defs::QUEUE_SIZES.to_vec()),
                     epoll_manager,
-                    TestMuxer::new(),
+                    muxer,
+                    metrics,
                 )
                 .unwrap(),
             }
@@ -386,6 +396,8 @@ mod tests {
             guest_txvq.avail.idx().store(1);
 
             let queues = vec![rxvq_config, txvq_config, evvq_config];
+            let muxer = TestMuxer::new();
+            let metrics = muxer.metrics.clone();
             EventHandlerContext {
                 guest_rxvq,
                 guest_txvq,
@@ -396,7 +408,8 @@ mod tests {
                     self.cid,
                     Arc::new(defs::QUEUE_SIZES.to_vec()),
                     EpollManager::default(),
-                    TestMuxer::new(),
+                    muxer,
+                    metrics,
                 )
                 .unwrap(),
                 mem: Arc::new(self.mem.clone()),

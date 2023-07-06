@@ -10,8 +10,6 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use dbs_device::resources::ResourceConstraint;
-use dbs_utils::epoll_manager::{EpollManager, SubscriberId};
 use log::debug;
 use log::trace;
 use log::warn;
@@ -19,13 +17,19 @@ use virtio_queue::QueueT;
 use vm_memory::GuestAddressSpace;
 use vm_memory::GuestMemoryRegion;
 
+use dbs_device::resources::ResourceConstraint;
+use dbs_utils::epoll_manager::{EpollManager, SubscriberId};
+use dbs_utils::metric::IncMetric;
+
+use crate::device::{VirtioDeviceConfig, VirtioDeviceInfo};
+use crate::vsock::metrics::VsockDeviceMetrics;
+use crate::{ActivateResult, DbsGuestAddressSpace, VirtioDevice};
+
 use super::backend::VsockBackend;
 use super::defs::uapi;
 use super::epoll_handler::VsockEpollHandler;
 use super::muxer::{Error as MuxerError, VsockGenericMuxer, VsockMuxer};
 use super::{Result, VsockError};
-use crate::device::{VirtioDeviceConfig, VirtioDeviceInfo};
-use crate::{ActivateResult, DbsGuestAddressSpace, VirtioDevice};
 
 const VSOCK_DRIVER_NAME: &str = "virtio-vsock";
 const VSOCK_CONFIG_SPACE_SIZE: usize = 8;
@@ -55,6 +59,7 @@ pub struct Vsock<AS: GuestAddressSpace, M: VsockGenericMuxer = VsockMuxer> {
     subscriber_id: Option<SubscriberId>,
     muxer: Option<M>,
     phantom: PhantomData<AS>,
+    metrics: Arc<VsockDeviceMetrics>,
 }
 
 // Default muxer implementation of Vsock
@@ -63,7 +68,8 @@ impl<AS: GuestAddressSpace> Vsock<AS> {
     /// backend.
     pub fn new(cid: u64, queue_sizes: Arc<Vec<u16>>, epoll_mgr: EpollManager) -> Result<Self> {
         let muxer = VsockMuxer::new(cid).map_err(VsockError::Muxer)?;
-        Self::new_with_muxer(cid, queue_sizes, epoll_mgr, muxer)
+        let metrics = muxer.metrics.clone();
+        Self::new_with_muxer(cid, queue_sizes, epoll_mgr, muxer, metrics)
     }
 }
 
@@ -73,6 +79,7 @@ impl<AS: GuestAddressSpace, M: VsockGenericMuxer> Vsock<AS, M> {
         queue_sizes: Arc<Vec<u16>>,
         epoll_mgr: EpollManager,
         muxer: M,
+        metrics: Arc<VsockDeviceMetrics>,
     ) -> Result<Self> {
         let mut config_space = Vec::with_capacity(VSOCK_CONFIG_SPACE_SIZE);
         for i in 0..VSOCK_CONFIG_SPACE_SIZE {
@@ -92,6 +99,7 @@ impl<AS: GuestAddressSpace, M: VsockGenericMuxer> Vsock<AS, M> {
             subscriber_id: None,
             muxer: Some(muxer),
             phantom: PhantomData,
+            metrics,
         })
     }
 
@@ -109,6 +117,10 @@ impl<AS: GuestAddressSpace, M: VsockGenericMuxer> Vsock<AS, M> {
         } else {
             Err(VsockError::Muxer(MuxerError::BackendAddAfterActivated))
         }
+    }
+
+    pub fn get_metrics(&self) -> Arc<VsockDeviceMetrics> {
+        self.metrics.clone()
     }
 }
 
@@ -141,25 +153,35 @@ where
     fn read_config(&mut self, offset: u64, data: &mut [u8]) {
         trace!(target: "virtio-vsock", "{}: VirtioDevice::read_config(0x{:x}, {:?})",
             self.id(), offset, data);
-        self.device_info.read_config(offset, data)
+        if !self.device_info.read_config(offset, data) {
+            self.metrics.cfg_fails.inc();
+        }
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
         trace!(target: "virtio-vsock", "{}: VirtioDevice::write_config(0x{:x}, {:?})",
         self.id(), offset, data);
-        self.device_info.write_config(offset, data)
+        if !self.device_info.write_config(offset, data) {
+            self.metrics.cfg_fails.inc();
+        }
     }
 
     fn activate(&mut self, config: VirtioDeviceConfig<AS, Q, R>) -> ActivateResult {
         trace!(target: "virtio-vsock", "{}: VirtioDevice::activate()", self.id());
 
-        self.device_info.check_queue_sizes(&config.queues[..])?;
+        self.device_info
+            .check_queue_sizes(&config.queues[..])
+            .map_err(|e| {
+                self.metrics.activate_fails.inc();
+                e
+            })?;
         let handler: VsockEpollHandler<AS, Q, R, M> = VsockEpollHandler::new(
             config,
             self.id().to_owned(),
             self.cid,
             // safe to unwrap, because we create muxer using New()
             self.muxer.take().unwrap(),
+            self.metrics.clone(),
         );
 
         self.subscriber_id = Some(self.device_info.register_event_handler(Box::new(handler)));
@@ -205,17 +227,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use dbs_device::resources::DeviceResources;
-    use dbs_interrupt::NoopNotifier;
     use kvm_ioctls::Kvm;
     use virtio_queue::QueueSync;
     use vm_memory::{GuestAddress, GuestMemoryMmap, GuestRegionMmap};
 
+    use dbs_device::resources::DeviceResources;
+    use dbs_interrupt::NoopNotifier;
+
+    use crate::device::VirtioDeviceConfig;
+    use crate::VirtioQueueConfig;
+
     use super::super::defs::uapi;
     use super::super::tests::{test_bytes, TestContext};
     use super::*;
-    use crate::device::VirtioDeviceConfig;
-    use crate::VirtioQueueConfig;
 
     impl<AS: DbsGuestAddressSpace, M: VsockGenericMuxer + 'static> Vsock<AS, M> {
         pub fn mock_activate(
@@ -234,6 +258,7 @@ mod tests {
                     self.cid,
                     // safe to unwrap, because we create muxer using New()
                     self.muxer.take().unwrap(),
+                    self.metrics.clone(),
                 );
 
             Ok(handler)
