@@ -16,9 +16,11 @@ use std::thread;
 use dbs_device::resources::ResourceConstraint;
 use dbs_utils::{
     epoll_manager::{EpollManager, SubscriberId},
+    metric::{IncMetric, SharedIncMetric},
     rate_limiter::{BucketUpdate, RateLimiter},
 };
 use log::{debug, error, info, warn};
+use serde::Serialize;
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_queue::QueueT;
 use vm_memory::GuestMemoryRegion;
@@ -43,6 +45,45 @@ const CONFIG_SPACE_SIZE: usize = 64;
 
 /// Max segments in a data request.
 const CONFIG_MAX_SEG: u32 = 16;
+
+/// Block Device associated metrics.
+#[derive(Default, Serialize)]
+pub struct BlockDeviceMetrics {
+    /// Number of times when handling events on a block device.
+    pub event_count: SharedIncMetric,
+    /// Number of times when activate failed on a block device.
+    pub activate_fails: SharedIncMetric,
+    /// Number of times when interacting with the space config of the block device failed.
+    pub cfg_fails: SharedIncMetric,
+    /// No available buffer for the block queue.
+    pub no_avail_buffer: SharedIncMetric,
+    /// Number of times when handling events on a block device failed.
+    pub event_fails: SharedIncMetric,
+    /// Number of failures in executing a request on a block device.
+    pub execute_fails: SharedIncMetric,
+    /// Number of events triggerd on the queue of the block device.
+    pub queue_event_count: SharedIncMetric,
+    /// Number of end io operation triggered on a block device.
+    pub end_io_event_count: SharedIncMetric,
+    /// Number of events ratelimiter-related on a block device.
+    pub rate_limiter_event_count: SharedIncMetric,
+    /// Number of kill operation triggered on a block device.
+    pub kill_event_count: SharedIncMetric,
+    /// Number of rate limiter throttling events on a block device.
+    pub rate_limiter_throttled_events: SharedIncMetric,
+    /// Number of invalid requests received for the block device.
+    pub invalid_reqs_count: SharedIncMetric,
+    /// Number of successful read operations.
+    pub read_count: SharedIncMetric,
+    /// Number of successful write operations.
+    pub write_count: SharedIncMetric,
+    /// Number of flushes operation triggered on a block device.
+    pub flush_count: SharedIncMetric,
+    /// Number of bytes read by this block device.
+    pub read_bytes: SharedIncMetric,
+    /// Number of bytes written by this block device.
+    pub write_bytes: SharedIncMetric,
+}
 
 fn build_device_id(disk_image: &dyn Ufile) -> Vec<u8> {
     let mut default_disk_image_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
@@ -70,6 +111,7 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     evt_senders: Vec<mpsc::Sender<KillEvent>>,
     epoll_threads: Vec<thread::JoinHandle<()>>,
     phantom: PhantomData<AS>,
+    metrics: Arc<BlockDeviceMetrics>,
 }
 
 impl<AS: DbsGuestAddressSpace> Block<AS> {
@@ -130,6 +172,7 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             evt_senders: Vec::with_capacity(num_queues),
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
+            metrics: Arc::new(BlockDeviceMetrics::default()),
         })
     }
 
@@ -196,6 +239,14 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
 
         Ok(())
     }
+
+    pub fn get_metrics(&self) -> Result<(String, Arc<BlockDeviceMetrics>)> {
+        // use the last image id as the block device id
+        Ok((
+            self.disk_images.last()?.get_device_id()?,
+            self.metrics.clone(),
+        ))
+    }
 }
 
 impl<AS, Q, R> VirtioDevice<AS, Q, R> for Block<AS>
@@ -221,11 +272,15 @@ where
     }
 
     fn read_config(&mut self, offset: u64, data: &mut [u8]) {
-        self.device_info.read_config(offset, data)
+        if !(self.device_info.read_config(offset, data)) {
+            self.metrics.cfg_fails.count();
+        }
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        self.device_info.write_config(offset, data)
+        if !self.device_info.write_config(offset, data) {
+            self.metrics.cfg_fails.count();
+        }
     }
 
     fn activate(&mut self, mut config: VirtioDeviceConfig<AS, Q, R>) -> ActivateResult {
@@ -237,6 +292,7 @@ where
                 self.disk_images.len(),
                 config.queues.len()
             );
+            self.metrics.activate_fails.inc();
             return Err(ActivateError::InternalError);
         }
         let mut kill_evts = Vec::with_capacity(self.queue_sizes.len());
@@ -259,7 +315,10 @@ where
             let (evt_sender, evt_receiver) = mpsc::channel();
             self.evt_senders.push(evt_sender);
 
-            let kill_evt = EventFd::new(EFD_NONBLOCK)?;
+            let kill_evt = EventFd::new(EFD_NONBLOCK).map_err(|e| {
+                self.metrics.activate_fails.inc();
+                e
+            })?;
 
             let mut handler = Box::new(InnerBlockEpollHandler {
                 rate_limiter,
@@ -272,6 +331,7 @@ where
                 vm_as: config.vm_as.clone(),
                 queue,
                 kill_evt: kill_evt.try_clone().unwrap(),
+                metrics: self.metrics.clone(),
             });
 
             kill_evts.push(kill_evt.try_clone().unwrap());
@@ -287,6 +347,7 @@ where
                 .map(|thread| self.epoll_threads.push(thread))
                 .map_err(|e| {
                     error!("failed to clone the virtio-block epoll thread: {}", e);
+                    self.metrics.activate_fails.inc();
                     ActivateError::InternalError
                 })?;
 
@@ -380,12 +441,12 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, GuestRegionMmap};
     use vmm_sys_util::eventfd::EventFd;
 
+    use crate::block::*;
     use crate::epoll_helper::*;
     use crate::tests::{VirtQueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::{Error as VirtIoError, VirtioQueueConfig};
 
     use super::*;
-    use crate::block::*;
 
     pub(super) struct DummyFile {
         pub(super) device_id: Option<String>,
@@ -499,6 +560,7 @@ mod tests {
         let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
         let mut data_descs = Vec::with_capacity(CONFIG_MAX_SEG as usize);
+        let metrics = Arc::new(BlockDeviceMetrics::default());
 
         assert!(vq.end().0 < 0x1000);
 
@@ -514,7 +576,12 @@ mod tests {
                 .unwrap();
             m.write_obj::<u64>(114, GuestAddress(0x1000 + 8)).unwrap();
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedWriteOnlyDescriptor)
             ));
         }
@@ -525,7 +592,12 @@ mod tests {
             // chain too short; no status_desc
             vq.dtable(0).flags().store(0);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::DescriptorChainTooShort)
             ));
         }
@@ -537,7 +609,12 @@ mod tests {
             vq.dtable(0).flags().store(VIRTQ_DESC_F_NEXT);
             vq.dtable(1).set(0x2000, 0x1000, 0, 2);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::DescriptorChainTooShort)
             ));
         }
@@ -551,7 +628,12 @@ mod tests {
                 .store(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
             vq.dtable(2).set(0x3000, 0, 0, 0);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedWriteOnlyDescriptor)
             ));
         }
@@ -566,7 +648,12 @@ mod tests {
                 .flags()
                 .store(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedWriteOnlyDescriptor)
             ));
         }
@@ -580,7 +667,12 @@ mod tests {
             vq.dtable(1).flags().store(VIRTQ_DESC_F_NEXT);
             vq.dtable(1).len().store(64);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::DescriptorLengthTooBig)
             ));
         }
@@ -593,7 +685,12 @@ mod tests {
                 .unwrap();
             vq.dtable(1).flags().store(VIRTQ_DESC_F_NEXT);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedReadOnlyDescriptor)
             ));
         }
@@ -609,7 +706,12 @@ mod tests {
                 .store(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
             vq.dtable(1).len().store(64);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::DescriptorLengthTooBig)
             ));
         }
@@ -624,7 +726,12 @@ mod tests {
                 .flags()
                 .store(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedReadOnlyDescriptor)
             ));
         }
@@ -635,7 +742,12 @@ mod tests {
             // status desc read only
             vq.dtable(2).flags().store(0);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::UnexpectedReadOnlyDescriptor)
             ));
         }
@@ -647,7 +759,12 @@ mod tests {
             vq.dtable(2).flags().store(VIRTQ_DESC_F_WRITE);
             vq.dtable(2).len().store(0);
             assert!(matches!(
-                Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32),
+                Request::parse(
+                    &mut q.pop_descriptor_chain(m).unwrap(),
+                    &mut data_descs,
+                    32,
+                    metrics.clone()
+                ),
                 Err(Error::DescriptorLengthTooSmall)
             ));
         }
@@ -657,8 +774,13 @@ mod tests {
             data_descs.clear();
             // should be OK now
             vq.dtable(2).len().store(0x1000);
-            let r = Request::parse(&mut q.pop_descriptor_chain(m).unwrap(), &mut data_descs, 32)
-                .unwrap();
+            let r = Request::parse(
+                &mut q.pop_descriptor_chain(m).unwrap(),
+                &mut data_descs,
+                32,
+                metrics.clone(),
+            )
+            .unwrap();
 
             assert_eq!(r.request_type, RequestType::GetDeviceID);
             assert_eq!(r.sector, 114);
@@ -682,6 +804,8 @@ mod tests {
         let mut disk: Box<dyn Ufile> = Box::new(file);
         let disk_id = build_device_id(disk.as_ref());
 
+        let metrics = Arc::new(BlockDeviceMetrics::default());
+
         {
             // RequestType::In
             let mut q = vq.create_queue();
@@ -696,6 +820,7 @@ mod tests {
                 &mut q.pop_descriptor_chain(m).unwrap(),
                 &mut data_descs,
                 0x100000,
+                metrics.clone(),
             )
             .unwrap();
             assert!(req.execute(&mut disk, m, &data_descs, &disk_id).is_ok());
@@ -714,6 +839,7 @@ mod tests {
                 &mut q.pop_descriptor_chain(m).unwrap(),
                 &mut data_descs,
                 0x100000,
+                metrics.clone(),
             )
             .unwrap();
             assert!(req.execute(&mut disk, m, &data_descs, &disk_id).is_ok());
@@ -732,6 +858,7 @@ mod tests {
                 &mut q.pop_descriptor_chain(m).unwrap(),
                 &mut data_descs,
                 0x100000,
+                metrics.clone(),
             )
             .unwrap();
             assert!(req.execute(&mut disk, m, &data_descs, &disk_id).is_ok());
@@ -751,6 +878,7 @@ mod tests {
                 &mut q.pop_descriptor_chain(m).unwrap(),
                 &mut data_descs,
                 0x100000,
+                metrics.clone(),
             )
             .unwrap();
             assert!(req.execute(&mut disk, m, &data_descs, &disk_id).is_ok());
@@ -770,6 +898,7 @@ mod tests {
                 &mut q.pop_descriptor_chain(m).unwrap(),
                 &mut data_descs,
                 0x100000,
+                metrics.clone(),
             )
             .unwrap();
             match req.execute(&mut disk, m, &data_descs, &disk_id) {
@@ -798,6 +927,7 @@ mod tests {
             &mut q.pop_descriptor_chain(m.as_ref()).unwrap(),
             &mut data_descs,
             0x100000,
+            Arc::new(BlockDeviceMetrics::default()),
         )
         .unwrap();
         req.update_status(m.as_ref(), 0);
@@ -814,6 +944,7 @@ mod tests {
 
         let mut disk: Box<dyn Ufile> = Box::new(DummyFile::new());
         let disk_id = build_device_id(disk.as_ref());
+        let metrics = Arc::new(BlockDeviceMetrics::default());
         let mut q = vq.create_queue();
         vq.dtable(0).set(0x1000, 0x1000, VIRTQ_DESC_F_NEXT, 1);
         vq.dtable(1)
@@ -825,6 +956,7 @@ mod tests {
             &mut q.pop_descriptor_chain(m).unwrap(),
             &mut data_descs,
             0x100000,
+            metrics.clone(),
         )
         .unwrap();
         assert!(matches!(
@@ -847,6 +979,7 @@ mod tests {
             &mut q.pop_descriptor_chain(m).unwrap(),
             &mut data_descs,
             0x100000,
+            metrics.clone(),
         )
         .unwrap();
         assert!(req.check_capacity(&mut disk, &data_descs).is_ok());
@@ -1067,6 +1200,7 @@ mod tests {
 
             vm_as: mem,
             queue,
+            metrics: Arc::new(BlockDeviceMetrics::default()),
         }
     }
 
@@ -1352,6 +1486,7 @@ mod tests {
             &mut q.pop_descriptor_chain(m).unwrap(),
             &mut data_descs,
             0x100000,
+            handler.metrics.clone(),
         )
         .unwrap();
         handler.pending_req_map.insert(0, req);
