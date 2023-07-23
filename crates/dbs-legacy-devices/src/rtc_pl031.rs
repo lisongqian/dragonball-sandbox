@@ -6,6 +6,7 @@
 //!
 //! This module implements a PL031 Real Time Clock (RTC) that provides to provides long time base counter.
 use std::convert::TryInto;
+use std::sync::Arc;
 
 use dbs_device::{DeviceIoMut, IoAddress};
 use dbs_utils::metric::{IncMetric, SharedIncMetric};
@@ -37,7 +38,7 @@ impl RtcEvents for RTCDeviceMetrics {
 
 /// The wrapper of Rtc struct to implement DeviceIoMut trait.
 pub struct RTCDevice {
-    pub rtc: Rtc<RTCDeviceMetrics>,
+    rtc: Rtc<RTCDeviceMetrics>,
 }
 
 impl Default for RTCDevice {
@@ -52,6 +53,10 @@ impl RTCDevice {
         Self {
             rtc: Rtc::with_events(metrics),
         }
+    }
+
+    pub fn metrics(&self) -> Arc<RTCDeviceMetrics> {
+        Arc::new(self.rtc.events())
     }
 }
 
