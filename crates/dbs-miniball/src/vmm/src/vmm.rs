@@ -517,7 +517,6 @@ impl Vmm {
             EventFdTrigger::new(EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFd)?);
         let i8042_device = Arc::new(Mutex::new(I8042Device::new(
             reset_evt.try_clone().map_err(Error::EventFd)?,
-            Arc::new(I8042DeviceMetrics::default()),
         )));
 
         self.vm.register_irqfd(&reset_evt, 1)?;
